@@ -6,38 +6,31 @@ Provides a command-line interface for interacting with MCP tools
 
 import os
 import sys
+import json
 import asyncio
 import subprocess
-import json
-from typing import Dict, Any, List, TypedDict, Annotated
+from typing import Dict, List, Any
 from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode
-from langgraph.graph.message import add_messages
 
 # Load environment variables
 load_dotenv()
 
 
-class AgentState(TypedDict):
-    """State for the agent graph"""
-    messages: Annotated[List, add_messages]
-    
-
-class MCPClient:
-    """Client to communicate with MCP server"""
+class SimpleMCPClient:
+    """Simplified MCP client"""
     
     def __init__(self):
         self.process = None
-        self.tools = {}
+        self.tools = []
         
     async def connect(self):
-        """Start the MCP server process and establish connection"""
-        # Start the MCP server as a subprocess
+        """Start MCP server subprocess"""
         self.process = await asyncio.create_subprocess_exec(
             sys.executable, "mcp_server.py",
             stdin=asyncio.subprocess.PIPE,
@@ -45,167 +38,158 @@ class MCPClient:
             stderr=asyncio.subprocess.PIPE
         )
         
-        # Initialize connection by sending initialize request
-        await self._send_request({
-            "jsonrpc": "2.0",
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "1.0.0",
-                "clientInfo": {
-                    "name": "agent-cli",
-                    "version": "1.0.0"
-                }
-            },
-            "id": 1
-        })
-        
         # Get available tools
-        response = await self._send_request({
-            "jsonrpc": "2.0",
-            "method": "tools/list",
-            "params": {},
-            "id": 2
-        })
-        
-        # Store tool definitions
-        if "result" in response and "tools" in response["result"]:
-            for tool_def in response["result"]["tools"]:
-                self.tools[tool_def["name"]] = tool_def
-                
-    async def _send_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Send a request to the MCP server and get response"""
-        if not self.process:
-            raise RuntimeError("MCP client not connected")
-            
-        # Send request
-        request_str = json.dumps(request) + "\n"
-        self.process.stdin.write(request_str.encode())
+        request = json.dumps({"method": "list_tools"}) + "\n"
+        self.process.stdin.write(request.encode())
         await self.process.stdin.drain()
         
-        # Read response
         response_line = await self.process.stdout.readline()
-        return json.loads(response_line.decode())
+        response = json.loads(response_line.decode())
+        self.tools = response.get("tools", [])
         
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+    async def call_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         """Call a tool on the MCP server"""
-        response = await self._send_request({
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments
-            },
-            "id": 3
-        })
+        request = json.dumps({
+            "method": "call_tool",
+            "tool": tool_name,
+            "args": args
+        }) + "\n"
+        
+        self.process.stdin.write(request.encode())
+        await self.process.stdin.drain()
+        
+        response_line = await self.process.stdout.readline()
+        response = json.loads(response_line.decode())
         
         if "error" in response:
-            raise Exception(f"Tool error: {response['error']}")
-            
-        return response.get("result", {}).get("content", [])
+            raise Exception(response["error"])
+        return response["result"]
         
     async def disconnect(self):
-        """Stop the MCP server process"""
+        """Stop the MCP server"""
         if self.process:
             self.process.terminate()
             await self.process.wait()
 
 
-# Global MCP client instance
-mcp_client = MCPClient()
-
-
-def create_mcp_tool(tool_name: str, tool_def: Dict[str, Any]):
-    """Create a LangChain tool from MCP tool definition"""
-    
-    @tool
-    async def mcp_tool(**kwargs):
-        """Dynamic MCP tool"""
-        result = await mcp_client.call_tool(tool_name, kwargs)
-        # Extract text content from MCP response
-        if isinstance(result, list) and len(result) > 0:
-            return result[0].get("text", str(result))
-        return str(result)
-    
-    # Set tool name and description
-    mcp_tool.__name__ = tool_name
-    mcp_tool.__doc__ = tool_def.get("description", f"MCP tool: {tool_name}")
-    
-    return mcp_tool
-
-
-async def create_agent():
-    """Create the LangGraph agent with MCP tools"""
-    # Connect to MCP server
-    await mcp_client.connect()
-    
-    # Create LangChain tools from MCP tools
+def create_tools(mcp_client: SimpleMCPClient) -> List:
+    """Create LangChain tools from MCP tools"""
     tools = []
-    for tool_name, tool_def in mcp_client.tools.items():
-        tools.append(create_mcp_tool(tool_name, tool_def))
     
-    # Initialize LLM (using OpenAI, but can be changed)
-    llm = ChatOpenAI(
-        model="gpt-4",
-        temperature=0,
-        api_key=os.getenv("OPENAI_API_KEY")
-    )
+    for tool_info in mcp_client.tools:
+        tool_name = tool_info["name"]
+        tool_desc = tool_info.get("description", f"MCP tool: {tool_name}")
+        
+        # Create a closure to capture the tool name and client
+        def make_tool(name, desc, client):
+            # Create the function with proper docstring
+            async def mcp_tool(**kwargs):
+                """Dynamically created MCP tool"""
+                return await client.call_tool(name, kwargs)
+            
+            # Set function attributes
+            mcp_tool.__name__ = name
+            mcp_tool.__doc__ = desc
+            
+            # Apply the tool decorator (without name parameter)
+            decorated_tool = tool(mcp_tool)
+            # Manually set the name after decoration
+            decorated_tool.name = name
+            decorated_tool.description = desc
+            
+            return decorated_tool
+            
+        tools.append(make_tool(tool_name, tool_desc, mcp_client))
     
-    # Bind tools to LLM
-    llm_with_tools = llm.bind_tools(tools)
-    
-    # Create the graph
-    workflow = StateGraph(AgentState)
-    
-    # Define the agent node
-    async def agent(state: AgentState):
-        """Agent node that calls the LLM"""
-        response = await llm_with_tools.ainvoke(state["messages"])
-        return {"messages": [response]}
-    
-    # Define conditional edge
-    def should_continue(state: AgentState):
-        """Check if we should continue to tools or end"""
-        last_message = state["messages"][-1]
-        if not last_message.tool_calls:
-            return END
-        return "tools"
-    
-    # Add nodes
-    workflow.add_node("agent", agent)
-    workflow.add_node("tools", ToolNode(tools))
-    
-    # Add edges
-    workflow.set_entry_point("agent")
-    workflow.add_conditional_edges(
-        "agent",
-        should_continue,
-        {
-            "tools": "tools",
-            END: END
-        }
-    )
-    workflow.add_edge("tools", "agent")
-    
-    # Compile the graph
-    return workflow.compile()
+    return tools
 
 
 async def main():
-    """Main CLI loop"""
+    """Main agent loop"""
     print("Starting Agent CLI...")
     print("Connecting to MCP server...")
     
+    # Initialize MCP client
+    mcp_client = SimpleMCPClient()
+    
     try:
-        # Create the agent
-        agent = await create_agent()
-        print("Connected! Available tools:")
-        for tool_name in mcp_client.tools:
-            print(f"  - {tool_name}")
-        print("\nType 'quit' to exit\n")
+        # Connect to MCP server
+        await mcp_client.connect()
+        print("\nAvailable tools:")
+        for tool_info in mcp_client.tools:
+            print(f"  - {tool_info['name']}: {tool_info.get('description', '')}")
         
-        # CLI loop
+        # Create tools
+        tools = create_tools(mcp_client)
+        
+        # Initialize LLM
+        llm = ChatOpenAI(
+            model="gpt-4",
+            temperature=0
+        )
+        
+        # Create simple agent graph with proper message handling
+        from langgraph.graph.message import add_messages
+        from typing import Annotated
+        
+        class State(dict):
+            messages: Annotated[list, add_messages]
+        
+        graph = StateGraph(State)
+        
+        # Agent node - calls LLM with tools
+        async def agent(state):
+            response = await llm.bind_tools(tools).ainvoke(state["messages"])
+            return {"messages": [response]}
+        
+        # Tool execution node
+        async def execute_tools(state):
+            tool_calls = state["messages"][-1].tool_calls
+            tool_messages = []
+            
+            for tool_call in tool_calls:
+                # Find the matching tool
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                
+                # Execute the tool
+                try:
+                    result = await mcp_client.call_tool(tool_name, tool_args)
+                    tool_messages.append({
+                        "role": "tool",
+                        "content": str(result),
+                        "tool_call_id": tool_call["id"]
+                    })
+                except Exception as e:
+                    tool_messages.append({
+                        "role": "tool", 
+                        "content": f"Error: {str(e)}",
+                        "tool_call_id": tool_call["id"]
+                    })
+            
+            return {"messages": tool_messages}
+        
+        # Conditional logic
+        def should_continue(state):
+            last_message = state["messages"][-1]
+            return "tools" if getattr(last_message, 'tool_calls', None) else "__end__"
+        
+        # Add nodes
+        graph.add_node("agent", agent)
+        graph.add_node("tools", execute_tools)
+        
+        # Add edges
+        graph.set_entry_point("agent")
+        graph.add_conditional_edges("agent", should_continue)
+        graph.add_edge("tools", "agent")
+        
+        # Compile
+        app = graph.compile()
+        
+        print("\nReady! Type 'quit' to exit.\n")
+        
+        # Main loop
         while True:
-            # Get user input
             user_input = input("You: ").strip()
             
             if user_input.lower() in ['quit', 'exit', 'q']:
@@ -214,32 +198,26 @@ async def main():
             if not user_input:
                 continue
             
-            # Process through agent
+            # Run the agent
             try:
-                state = {"messages": [HumanMessage(content=user_input)]}
+                result = await app.ainvoke({
+                    "messages": [HumanMessage(content=user_input)]
+                })
                 
-                # Run the agent
-                result = await agent.ainvoke(state)
-                
-                # Get the final message
+                # Print response
                 final_message = result["messages"][-1]
+                print(f"Agent: {final_message.content}")
                 
-                # Print the response
-                if isinstance(final_message, AIMessage):
-                    print(f"Agent: {final_message.content}")
-                    
             except Exception as e:
                 print(f"Error: {e}")
-        
+    
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
+        print("\nInterrupted.")
     except Exception as e:
         print(f"Error: {e}")
     finally:
-        # Disconnect from MCP server
-        print("\nDisconnecting from MCP server...")
+        print("\nDisconnecting...")
         await mcp_client.disconnect()
-        print("Goodbye!")
 
 
 if __name__ == "__main__":
