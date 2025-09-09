@@ -1,18 +1,18 @@
-# MCP Agent System (Simplified)
+# MCP Agent System - HTTP Architecture
 
-A straightforward two-file Python system demonstrating Model Context Protocol (MCP) with a LangGraph agent.
+A straightforward Python system demonstrating Model Context Protocol (MCP) over HTTP with a LangGraph agent.
 
-## What's Been Simplified
+## What's Changed
 
-1. **Minimal Protocol**: Simple JSON messages instead of full JSON-RPC
-2. **Less Boilerplate**: Removed complex type schemas and protocol negotiations  
-3. **Cleaner Code**: Reduced from ~300 to ~170 lines total
-4. **Fewer Tools**: Just the essentials to demonstrate the pattern
+1. **HTTP Communication**: MCP server now runs as a FastAPI HTTP server instead of stdio
+2. **Separate Processes**: Server and client run independently for better scalability
+3. **RESTful API**: Clean HTTP endpoints for tool discovery and execution
+4. **Better Error Handling**: HTTP status codes and structured error responses
 
 ## Architecture
 
-1. **`mcp_server.py`** - Simple tool server that reads/writes JSON via stdio
-2. **`agent_cli.py`** - LangGraph agent that spawns the server and provides a CLI
+1. **`mcp_server.py`** - FastAPI-based tool server with HTTP endpoints
+2. **`agent_cli.py`** - LangGraph agent that connects to the server via HTTP
 
 ## Quick Start
 
@@ -26,16 +26,24 @@ A straightforward two-file Python system demonstrating Model Context Protocol (M
    OPENAI_API_KEY=your-key-here
    ```
 
-3. Run the agent:
+3. **Start the MCP server** (in one terminal):
+   ```bash
+   python mcp_server.py
+   ```
+   Server will start on http://127.0.0.1:8000
+
+4. **Run the agent** (in another terminal):
    ```bash
    python agent_cli.py
    ```
 
 ## How It Works
 
-The system uses a simple protocol:
-- **List tools**: `{"method": "list_tools"}` → Returns available tools
-- **Call tool**: `{"method": "call_tool", "tool": "add", "args": {"a": 1, "b": 2}}` → Returns result
+The system uses HTTP REST API:
+- **GET /tools** - List available tools
+- **POST /tools/call** - Execute a tool with JSON payload: `{"tool": "add", "args": {"a": 1, "b": 2}}`
+
+The agent automatically discovers tools from the server and creates LangChain tools for the LLM.
 
 Example interaction:
 ```
@@ -54,6 +62,34 @@ Agent: HELLO
 - `uppercase(text)` - Convert to uppercase
 - `count_words(text)` - Count words
 
+## API Endpoints
+
+### GET /tools
+Returns list of available tools:
+```json
+{
+  "tools": [
+    {"name": "add", "description": "Add two numbers"},
+    {"name": "multiply", "description": "Multiply two numbers"}
+  ]
+}
+```
+
+### POST /tools/call
+Execute a tool:
+```json
+// Request
+{
+  "tool": "add",
+  "args": {"a": 5, "b": 3}
+}
+
+// Response
+{
+  "result": "8"
+}
+```
+
 ## Adding New Tools
 
 Just add a function to `mcp_server.py`:
@@ -65,4 +101,11 @@ async def my_tool(param: str) -> str:
     return f"Result: {param}"
 ```
 
-The agent will automatically discover it on next run.
+Restart the server and the agent will automatically discover the new tool.
+
+## Benefits of HTTP Architecture
+
+- **Scalability**: Server can handle multiple concurrent clients
+- **Language Agnostic**: Any HTTP client can connect to the MCP server
+- **Debugging**: Easy to test endpoints with curl or browser
+- **Production Ready**: Can be deployed behind load balancers, with authentication, etc.

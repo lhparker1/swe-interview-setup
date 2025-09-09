@@ -1,71 +1,84 @@
 #!/usr/bin/env python3
 """
-MCP Server - Provides tools via Model Context Protocol
+MCP Server - Provides tools via Model Context Protocol over HTTP
 This server exposes basic tools like calculator, time, and text operations
 """
 
 import json
-import sys
 import datetime
 import asyncio
 from typing import Any, Dict
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
+
+
+class ToolRequest(BaseModel):
+    tool: str
+    args: Dict[str, Any] = {}
+
+
+class ToolListResponse(BaseModel):
+    tools: list
+
+
+class ToolCallResponse(BaseModel):
+    result: str
+
+
+class ErrorResponse(BaseModel):
+    error: str
 
 
 class SimpleMCPServer:
-    """Simplified MCP Server implementation"""
+    """Simplified MCP Server implementation with HTTP API"""
     
     def __init__(self):
         self.tools = {}
+        self.app = FastAPI(title="MCP Server", version="1.0.0")
+        self.setup_routes()
         
     def tool(self, func):
         """Decorator to register a tool"""
         self.tools[func.__name__] = func
         return func
+    
+    def setup_routes(self):
+        """Setup FastAPI routes"""
         
-    async def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle incoming requests"""
-        method = request.get("method")
-        
-        if method == "list_tools":
-            # Return available tools
-            return {
-                "tools": [
-                    {"name": name, "description": func.__doc__}
+        @self.app.get("/tools", response_model=ToolListResponse)
+        async def list_tools():
+            """List available tools"""
+            return ToolListResponse(
+                tools=[
+                    {"name": name, "description": func.__doc__ or ""}
                     for name, func in self.tools.items()
                 ]
-            }
+            )
+        
+        @self.app.post("/tools/call", response_model=ToolCallResponse)
+        async def call_tool(request: ToolRequest):
+            """Call a specific tool"""
+            tool_name = request.tool
+            args = request.args
             
-        elif method == "call_tool":
-            # Execute a tool
-            tool_name = request.get("tool")
-            args = request.get("args", {})
+            if tool_name not in self.tools:
+                raise HTTPException(status_code=404, detail=f"Unknown tool: {tool_name}")
             
-            if tool_name in self.tools:
-                result = await self.tools[tool_name](**args)
-                return {"result": str(result)}
-            else:
-                return {"error": f"Unknown tool: {tool_name}"}
-                
-        else:
-            return {"error": f"Unknown method: {method}"}
-            
-    async def run(self):
-        """Run the server - read JSON from stdin, write JSON to stdout"""
-        while True:
             try:
-                line = sys.stdin.readline()
-                if not line:
-                    break
-                    
-                request = json.loads(line.strip())
-                response = await self.handle_request(request)
-                
-                print(json.dumps(response))
-                sys.stdout.flush()
-                
+                result = await self.tools[tool_name](**args)
+                return ToolCallResponse(result=str(result))
             except Exception as e:
-                print(json.dumps({"error": str(e)}))
-                sys.stdout.flush()
+                raise HTTPException(status_code=400, detail=str(e))
+    
+    def run(self, host: str = "127.0.0.1", port: int = 8000):
+        """Run the HTTP server"""
+        print(f"Starting MCP server on http://{host}:{port}")
+        print("Available tools:")
+        for name, func in self.tools.items():
+            print(f"  - {name}: {func.__doc__ or 'No description'}")
+        
+        uvicorn.run(self.app, host=host, port=port, log_level="info")
 
 
 # Create server and register tools
@@ -103,4 +116,4 @@ async def count_words(text: str) -> int:
 
 
 if __name__ == "__main__":
-    asyncio.run(server.run())
+    server.run()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Agent CLI - LangGraph-based agent that connects to MCP server
+Agent CLI - LangGraph-based agent that connects to MCP server via HTTP
 Provides a command-line interface for interacting with MCP tools
 """
 
@@ -8,9 +8,9 @@ import os
 import sys
 import json
 import asyncio
-import subprocess
 from typing import Dict, List, Any
 from dotenv import load_dotenv
+import httpx
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
@@ -22,57 +22,53 @@ from langgraph.prebuilt import ToolNode
 load_dotenv()
 
 
-class SimpleMCPClient:
-    """Simplified MCP client"""
+class HTTPMCPClient:
+    """HTTP-based MCP client"""
     
-    def __init__(self):
-        self.process = None
+    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
+        self.base_url = base_url
         self.tools = []
+        self.client = httpx.AsyncClient()
         
     async def connect(self):
-        """Start MCP server subprocess"""
-        self.process = await asyncio.create_subprocess_exec(
-            sys.executable, "mcp_server.py",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        # Get available tools
-        request = json.dumps({"method": "list_tools"}) + "\n"
-        self.process.stdin.write(request.encode())
-        await self.process.stdin.drain()
-        
-        response_line = await self.process.stdout.readline()
-        response = json.loads(response_line.decode())
-        self.tools = response.get("tools", [])
+        """Connect to MCP server and fetch available tools"""
+        try:
+            response = await self.client.get(f"{self.base_url}/tools")
+            response.raise_for_status()
+            data = response.json()
+            self.tools = data.get("tools", [])
+        except httpx.RequestError as e:
+            raise ConnectionError(f"Could not connect to MCP server at {self.base_url}: {e}")
+        except httpx.HTTPStatusError as e:
+            raise ConnectionError(f"HTTP error from MCP server: {e.response.status_code}")
         
     async def call_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         """Call a tool on the MCP server"""
-        request = json.dumps({
-            "method": "call_tool",
-            "tool": tool_name,
-            "args": args
-        }) + "\n"
-        
-        self.process.stdin.write(request.encode())
-        await self.process.stdin.drain()
-        
-        response_line = await self.process.stdout.readline()
-        response = json.loads(response_line.decode())
-        
-        if "error" in response:
-            raise Exception(response["error"])
-        return response["result"]
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/tools/call",
+                json={"tool": tool_name, "args": args}
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["result"]
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise Exception(f"Tool '{tool_name}' not found")
+            elif e.response.status_code == 400:
+                error_detail = e.response.json().get("detail", "Bad request")
+                raise Exception(f"Tool execution error: {error_detail}")
+            else:
+                raise Exception(f"HTTP error {e.response.status_code}: {e.response.text}")
+        except httpx.RequestError as e:
+            raise Exception(f"Request error: {e}")
         
     async def disconnect(self):
-        """Stop the MCP server"""
-        if self.process:
-            self.process.terminate()
-            await self.process.wait()
+        """Close the HTTP client"""
+        await self.client.aclose()
 
 
-def create_tools(mcp_client: SimpleMCPClient) -> List:
+def create_tools(mcp_client: HTTPMCPClient) -> List:
     """Create LangChain tools from MCP tools"""
     tools = []
     
@@ -110,12 +106,13 @@ async def main():
     print("Connecting to MCP server...")
     
     # Initialize MCP client
-    mcp_client = SimpleMCPClient()
+    mcp_client = HTTPMCPClient()
     
     try:
         # Connect to MCP server
         await mcp_client.connect()
-        print("\nAvailable tools:")
+        print(f"\nConnected to MCP server at {mcp_client.base_url}")
+        print("Available tools:")
         for tool_info in mcp_client.tools:
             print(f"  - {tool_info['name']}: {tool_info.get('description', '')}")
         
@@ -186,7 +183,8 @@ async def main():
         # Compile
         app = graph.compile()
         
-        print("\nReady! Type 'quit' to exit.\n")
+        print("\nReady! Type 'quit' to exit.")
+        print("Note: Make sure the MCP server is running separately with: python mcp_server.py\n")
         
         # Main loop
         while True:
